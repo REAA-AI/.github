@@ -1,5 +1,5 @@
 ---
-name: General issue
+name: 📝 General issue
 about: A general-purpose task with what/why, acceptance criteria, and scope.
 title: ''
 labels: ''
