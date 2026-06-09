@@ -1,0 +1,147 @@
+name: Roadmap dates from PR lifecycle (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project_number:
+        description: 'GitHub Project number (visible in the project URL)'
+        required: true
+        type: number
+      org:
+        description: 'GitHub org that owns the project'
+        required: false
+        type: string
+        default: 'REAA-AI'
+      start_field:
+        description: 'Project field name to use as start date'
+        required: false
+        type: string
+        default: 'Start date'
+      end_field:
+        description: 'Project field name to use as end date'
+        required: false
+        type: string
+        default: 'Target date'
+    secrets:
+      PROJECT_PAT:
+        required: true
+
+jobs:
+  update-roadmap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set start/end dates on linked project issues
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          ORG: ${{ inputs.org }}
+          PROJECT_NUM: ${{ inputs.project_number }}
+          START_FIELD_NAME: ${{ inputs.start_field }}
+          END_FIELD_NAME: ${{ inputs.end_field }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Resolve project ID and field IDs by name (works for any project)
+          PROJECT_DATA=$(gh api graphql -f query='
+            query($org: String!, $num: Int!) {
+              organization(login: $org) {
+                projectV2(number: $num) {
+                  id
+                  fields(first: 30) {
+                    nodes {
+                      ... on ProjectV2Field { id name }
+                      ... on ProjectV2IterationField { id name }
+                      ... on ProjectV2SingleSelectField { id name }
+                    }
+                  }
+                }
+              }
+            }' -f org="$ORG" -F num="$PROJECT_NUM")
+
+          PROJECT_ID=$(echo "$PROJECT_DATA" | jq -r '.data.organization.projectV2.id')
+          START_FIELD_ID=$(echo "$PROJECT_DATA" | jq -r --arg n "$START_FIELD_NAME" \
+            '.data.organization.projectV2.fields.nodes[] | select(.name == $n) | .id')
+          END_FIELD_ID=$(echo "$PROJECT_DATA" | jq -r --arg n "$END_FIELD_NAME" \
+            '.data.organization.projectV2.fields.nodes[] | select(.name == $n) | .id')
+
+          if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+            echo "Project #$PROJECT_NUM not found in org $ORG — skipping."
+            exit 0
+          fi
+          if [ -z "$START_FIELD_ID" ] || [ -z "$END_FIELD_ID" ]; then
+            echo "Could not find fields '$START_FIELD_NAME' / '$END_FIELD_NAME' in project — skipping."
+            exit 0
+          fi
+
+          # Resolve issues linked via closing keywords (Closes #N, Fixes #N, etc.)
+          REPO_OWNER=$(echo "${{ github.repository }}" | cut -d'/' -f1)
+          LINKED=$(gh api graphql -f query='
+            query($owner: String!, $repo: String!, $pr: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                  closingIssuesReferences(first: 20) {
+                    nodes { number }
+                  }
+                }
+              }
+            }' \
+            -f owner="$REPO_OWNER" -f repo="$REPO_NAME" -F pr="$PR_NUMBER" \
+            --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[].number')
+
+          if [ -z "$LINKED" ]; then
+            echo "No linked issues found for PR #$PR_NUMBER — nothing to update."
+            exit 0
+          fi
+
+          for ISSUE in $LINKED; do
+            ITEM_ID=$(gh api graphql -f query='
+              query($owner: String!, $repo: String!, $num: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $num) {
+                    projectItems(first: 10) {
+                      nodes { id project { id } }
+                    }
+                  }
+                }
+              }' \
+              -f owner="$REPO_OWNER" -f repo="$REPO_NAME" -F num="$ISSUE" \
+              --jq ".data.repository.issue.projectItems.nodes[] | select(.project.id == \"$PROJECT_ID\") | .id")
+
+            if [ -z "$ITEM_ID" ]; then
+              echo "Issue #$ISSUE is not in project #$PROJECT_NUM — skipping."
+              continue
+            fi
+
+            if [ "$PR_ACTION" = "opened" ] || [ "$PR_ACTION" = "reopened" ]; then
+              DATE="${PR_CREATED_AT:0:10}"
+              gh api graphql -f query="
+                mutation {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: \"$PROJECT_ID\"
+                    itemId: \"$ITEM_ID\"
+                    fieldId: \"$START_FIELD_ID\"
+                    value: { date: \"$DATE\" }
+                  }) { projectV2Item { id } }
+                }"
+              echo "Issue #$ISSUE — start date set to $DATE"
+
+            elif [ "$PR_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
+              DATE="${PR_MERGED_AT:0:10}"
+              gh api graphql -f query="
+                mutation {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: \"$PROJECT_ID\"
+                    itemId: \"$ITEM_ID\"
+                    fieldId: \"$END_FIELD_ID\"
+                    value: { date: \"$DATE\" }
+                  }) { projectV2Item { id } }
+                }"
+              echo "Issue #$ISSUE — target date set to $DATE (merged)"
+
+            else
+              echo "PR closed without merge — no date written."
+            fi
+          done
