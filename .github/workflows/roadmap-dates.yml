@@ -67,14 +67,66 @@ jobs:
           END_FIELD_ID=$(echo "$PROJECT_DATA" | jq -r --arg n "$END_FIELD_NAME" \
             '.data.organization.projectV2.fields.nodes[] | select(.name == $n) | .id')
 
+          # GitHub now stores the reserved "Start date" / "Target date" columns as
+          # native, org-level ISSUE fields (IFD_*), not project fields (PVTF_*).
+          # Writing them on an issue-backed project item via
+          # updateProjectV2ItemFieldValue is REJECTED ("must be updated using the
+          # updateIssueFieldValue mutation") — REAA-AI/REAA#430. So we resolve the
+          # matching issue-field IDs and prefer updateIssueFieldValue; the project
+          # field path is kept as a fallback for projects using genuine custom
+          # (non-issue) date fields.
+          ISSUE_FIELD_DATA=$(gh api graphql -f query='
+            query($org: String!) {
+              organization(login: $org) {
+                issueFields(first: 50) {
+                  nodes {
+                    __typename
+                    ... on IssueFieldDate { id name }
+                  }
+                }
+              }
+            }' -f org="$ORG")
+          START_ISSUE_FIELD_ID=$(echo "$ISSUE_FIELD_DATA" | jq -r --arg n "$START_FIELD_NAME" \
+            '.data.organization.issueFields.nodes[] | select(.name == $n) | .id')
+          END_ISSUE_FIELD_ID=$(echo "$ISSUE_FIELD_DATA" | jq -r --arg n "$END_FIELD_NAME" \
+            '.data.organization.issueFields.nodes[] | select(.name == $n) | .id')
+
           if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
             echo "Project #$PROJECT_NUM not found in org $ORG — skipping."
             exit 0
           fi
-          if [ -z "$START_FIELD_ID" ] || [ -z "$END_FIELD_ID" ]; then
-            echo "Could not find fields '$START_FIELD_NAME' / '$END_FIELD_NAME' in project — skipping."
+          # Need at least one resolvable field (issue OR project) per date.
+          if [ -z "${START_FIELD_ID}${START_ISSUE_FIELD_ID}" ] || [ -z "${END_FIELD_ID}${END_ISSUE_FIELD_ID}" ]; then
+            echo "Could not resolve '$START_FIELD_NAME' / '$END_FIELD_NAME' as project or issue fields — skipping."
             exit 0
           fi
+
+          # Write a date onto an issue. Prefers the issue-field mutation (keyed by
+          # the issue node id); falls back to the project-item mutation for custom
+          # project date fields. Reads ISSUE_NODE_ID / ITEM_ID / ISSUE from the loop.
+          set_date() {
+            local label="$1" issue_field_id="$2" project_field_id="$3" date_val="$4"
+            if [ -n "$issue_field_id" ]; then
+              gh api graphql -f query="
+                mutation {
+                  updateIssueFieldValue(input: {
+                    issueId: \"$ISSUE_NODE_ID\"
+                    issueField: { fieldId: \"$issue_field_id\", dateValue: \"$date_val\" }
+                  }) { clientMutationId }
+                }"
+            else
+              gh api graphql -f query="
+                mutation {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: \"$PROJECT_ID\"
+                    itemId: \"$ITEM_ID\"
+                    fieldId: \"$project_field_id\"
+                    value: { date: \"$date_val\" }
+                  }) { projectV2Item { id } }
+                }"
+            fi
+            echo "Issue #$ISSUE — $label set to $date_val"
+          }
 
           # Resolve issues linked via closing keywords (Closes #N, Fixes #N, etc.)
           REPO_OWNER=$(echo "${{ github.repository }}" | cut -d'/' -f1)
@@ -97,18 +149,21 @@ jobs:
           fi
 
           for ISSUE in $LINKED; do
-            ITEM_ID=$(gh api graphql -f query='
+            ISSUE_DATA=$(gh api graphql -f query='
               query($owner: String!, $repo: String!, $num: Int!) {
                 repository(owner: $owner, name: $repo) {
                   issue(number: $num) {
+                    id
                     projectItems(first: 10) {
                       nodes { id project { id } }
                     }
                   }
                 }
               }' \
-              -f owner="$REPO_OWNER" -f repo="$REPO_NAME" -F num="$ISSUE" \
-              --jq ".data.repository.issue.projectItems.nodes[] | select(.project.id == \"$PROJECT_ID\") | .id")
+              -f owner="$REPO_OWNER" -f repo="$REPO_NAME" -F num="$ISSUE")
+
+            ISSUE_NODE_ID=$(echo "$ISSUE_DATA" | jq -r '.data.repository.issue.id')
+            ITEM_ID=$(echo "$ISSUE_DATA" | jq -r ".data.repository.issue.projectItems.nodes[] | select(.project.id == \"$PROJECT_ID\") | .id")
 
             if [ -z "$ITEM_ID" ]; then
               echo "Issue #$ISSUE is not in project #$PROJECT_NUM — skipping."
@@ -116,30 +171,10 @@ jobs:
             fi
 
             if [ "$PR_ACTION" = "opened" ] || [ "$PR_ACTION" = "reopened" ]; then
-              DATE="${PR_CREATED_AT:0:10}"
-              gh api graphql -f query="
-                mutation {
-                  updateProjectV2ItemFieldValue(input: {
-                    projectId: \"$PROJECT_ID\"
-                    itemId: \"$ITEM_ID\"
-                    fieldId: \"$START_FIELD_ID\"
-                    value: { date: \"$DATE\" }
-                  }) { projectV2Item { id } }
-                }"
-              echo "Issue #$ISSUE — start date set to $DATE"
+              set_date "start date" "$START_ISSUE_FIELD_ID" "$START_FIELD_ID" "${PR_CREATED_AT:0:10}"
 
             elif [ "$PR_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
-              DATE="${PR_MERGED_AT:0:10}"
-              gh api graphql -f query="
-                mutation {
-                  updateProjectV2ItemFieldValue(input: {
-                    projectId: \"$PROJECT_ID\"
-                    itemId: \"$ITEM_ID\"
-                    fieldId: \"$END_FIELD_ID\"
-                    value: { date: \"$DATE\" }
-                  }) { projectV2Item { id } }
-                }"
-              echo "Issue #$ISSUE — target date set to $DATE (merged)"
+              set_date "target date" "$END_ISSUE_FIELD_ID" "$END_FIELD_ID" "${PR_MERGED_AT:0:10}"
 
             else
               echo "PR closed without merge — no date written."
